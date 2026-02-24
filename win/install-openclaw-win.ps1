@@ -126,28 +126,43 @@ function Invoke-CommandLogged {
         [string]$Command,
         [string[]]$Arguments
     )
-    Write-LogDebug "执行命令: $Command $($Arguments -join ' ')"
+    $fullCmd = "$Command $($Arguments -join ' ')"
+    Write-LogDebug "执行命令: $fullCmd"
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
+    $stdoutFile = [System.IO.Path]::GetTempFileName()
+    $stderrFile = [System.IO.Path]::GetTempFileName()
+
     try {
-        $output = & $Command @Arguments 2>&1 | Out-String
-        $exitCode = $LASTEXITCODE
-        if ($null -eq $exitCode) { $exitCode = 0 }
+        # npm/pnpm on Windows are .ps1/.cmd wrappers; run via cmd /c for reliable exit codes
+        $cmdLine = "$fullCmd"
+        $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c", $cmdLine -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+        $exitCode = $proc.ExitCode
+
+        $stdout = ""
+        $stderr = ""
+        if (Test-Path $stdoutFile) { $stdout = Get-Content $stdoutFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue }
+        if (Test-Path $stderrFile) { $stderr = Get-Content $stderrFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue }
+        $output = ("$stdout`n$stderr").Trim()
     }
     catch {
         $output = $_.Exception.Message
         $exitCode = 1
     }
+    finally {
+        Remove-Item $stdoutFile -Force -ErrorAction SilentlyContinue
+        Remove-Item $stderrFile -Force -ErrorAction SilentlyContinue
+    }
 
     if ($output) {
         Write-Log "[$ts] [CMD]   [$Description] 输出:"
-        Write-Log $output.Trim()
+        Write-Log $output
     }
     if ($exitCode -ne 0) {
         Write-Log "[$ts] [CMD]   [$Description] 退出码: $exitCode"
     }
     if ($VerbosePreference -eq "Continue" -and $output) {
-        $output.Trim().Split("`n") | ForEach-Object {
+        $output.Split("`n") | ForEach-Object {
             Write-Host "     $_" -ForegroundColor Gray
         }
     }

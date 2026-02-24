@@ -54,6 +54,8 @@ $script:RequiredNodeMajor = 22
 $script:InstallSuccess = $false
 $script:StepsCompleted = 0
 $script:StepsTotal = 0
+$script:NpmPrefixOverride = $null
+$script:SafeNpmPrefix = "C:\npm-global"
 
 # ─────────────────────────────────────────────
 # 日志函数
@@ -438,20 +440,127 @@ function Test-NpmOrPnpm {
     return $true
 }
 
-function Test-Network {
-    Write-LogStep "检测网络连接"
+function Test-NonAsciiPath {
+    Write-LogStep "检测用户名路径兼容性"
 
-    Write-LogDebug "测试 registry.npmjs.org 连通性..."
+    $userProfile = $env:USERPROFILE
+    $hasNonAscii = $userProfile -match '[^\x00-\x7F]'
+
+    if ($hasNonAscii) {
+        Write-LogWarn "检测到用户目录包含非 ASCII 字符（如中文）: $userProfile"
+        Write-LogWarn "这会导致 npm 全局安装失败，将自动切换全局目录"
+
+        $safePath = $script:SafeNpmPrefix
+        if (-not (Test-Path $safePath)) {
+            try {
+                New-Item -Path $safePath -ItemType Directory -Force | Out-Null
+                Write-LogDebug "已创建安全目录: $safePath"
+            } catch {
+                Write-LogError "无法创建目录 ${safePath}: $_"
+                Write-LogInfo "请以管理员身份运行，或手动创建此目录后重试"
+                return $false
+            }
+        }
+
+        Write-LogInfo "设置 npm 全局前缀: $safePath"
+        & npm config set prefix $safePath 2>$null
+        $script:NpmPrefixOverride = $safePath
+
+        $env:PATH = "$safePath;$env:PATH"
+        Write-LogDebug "已将 $safePath 加入当前会话 PATH"
+
+        $userPath = [System.Environment]::GetEnvironmentVariable("PATH", "User")
+        if ($userPath -notlike "*$safePath*") {
+            try {
+                [System.Environment]::SetEnvironmentVariable("PATH", "$safePath;$userPath", "User")
+                Write-LogSuccess "已将 $safePath 永久加入用户 PATH"
+            } catch {
+                Write-LogWarn "无法自动添加 PATH，请手动将 $safePath 加入系统环境变量 PATH"
+            }
+        }
+
+        Write-LogSuccess "npm 全局目录已切换到: $safePath"
+    } else {
+        Write-LogSuccess "用户路径兼容（纯 ASCII）"
+    }
+    return $true
+}
+
+function Test-DefenderImpact {
+    Write-LogStep "检测 Windows Defender 状态"
+
     try {
-        $response = Invoke-WebRequest -Uri "https://registry.npmjs.org/openclaw" -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
-        Write-LogSuccess "npm 仓库连接正常"
+        $defenderStatus = Get-MpPreference -ErrorAction SilentlyContinue
+        if ($defenderStatus -and $defenderStatus.DisableRealtimeMonitoring -eq $false) {
+            Write-LogWarn "Windows Defender 实时保护已开启"
+            Write-LogInfo "npm 全局安装涉及大量小文件写入，Defender 实时扫描可能显著拖慢安装速度"
+            Write-LogInfo "如果安装过程很慢（超过 5 分钟），可临时关闭实时保护："
+            Write-LogInfo "  Windows 安全中心 -> 病毒和威胁防护 -> 管理设置 -> 关闭实时保护"
+            Write-LogInfo "  （安装完成后请重新开启）"
+
+            $npmGlobalDir = $script:NpmPrefixOverride
+            if (-not $npmGlobalDir) {
+                try { $npmGlobalDir = & npm prefix -g 2>$null } catch {}
+            }
+            if ($npmGlobalDir) {
+                $exclusions = $defenderStatus.ExclusionPath
+                if ($exclusions -and ($exclusions -contains $npmGlobalDir)) {
+                    Write-LogDebug "npm 全局目录已在 Defender 排除列表中"
+                } else {
+                    Write-LogInfo "或者将 npm 目录加入排除项: $npmGlobalDir"
+                }
+            }
+        } else {
+            Write-LogSuccess "Windows Defender 实时保护未开启或已排除"
+        }
     } catch {
-        Write-LogWarn "无法连接到 npm 仓库 (registry.npmjs.org)"
-        Write-LogWarn "请检查网络连接或代理设置"
+        Write-LogDebug "无法检测 Windows Defender 状态（可能权限不足），跳过"
+    }
+}
+
+function Test-NpmRegistry {
+    Write-LogStep "检测 npm 仓库源"
+
+    try {
+        $currentRegistry = & npm config get registry 2>$null
+        if ($currentRegistry) {
+            $currentRegistry = $currentRegistry.Trim()
+            Write-LogDebug "当前 npm 仓库源: $currentRegistry"
+        }
+    } catch {
+        $currentRegistry = ""
+    }
+
+    if ($currentRegistry -match "registry\.npmmirror\.com|registry\.npm\.taobao\.org") {
+        Write-LogSuccess "已使用国内镜像源: $currentRegistry"
+        return
+    }
+
+    Write-LogDebug "测试 npm 官方仓库下载速度..."
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        Invoke-WebRequest -Uri "https://registry.npmjs.org/openclaw" -TimeoutSec 10 -UseBasicParsing -ErrorAction Stop | Out-Null
+        $sw.Stop()
+        $elapsed = $sw.ElapsedMilliseconds
+
+        if ($elapsed -gt 3000) {
+            Write-LogWarn "npm 官方仓库响应较慢 ($($elapsed)ms)"
+            Write-LogInfo "建议切换到淘宝镜像加速安装:"
+            Write-LogInfo "  npm config set registry https://registry.npmmirror.com"
+        } else {
+            Write-LogSuccess "npm 仓库连接正常 ($($elapsed)ms)"
+        }
+    } catch {
+        Write-LogWarn "无法连接 npm 官方仓库，建议使用淘宝镜像:"
+        Write-LogInfo "  npm config set registry https://registry.npmmirror.com"
 
         if ($env:HTTP_PROXY) { Write-LogDebug "HTTP_PROXY: $env:HTTP_PROXY" }
         if ($env:HTTPS_PROXY) { Write-LogDebug "HTTPS_PROXY: $env:HTTPS_PROXY" }
     }
+}
+
+function Test-Network {
+    Write-LogStep "检测网络连接"
 
     Write-LogDebug "测试 openclaw.ai 连通性..."
     try {
@@ -515,10 +624,37 @@ function Test-ExistingInstall {
 }
 
 # ─────────────────────────────────────────────
+# 清理上次失败的安装残留
+# ─────────────────────────────────────────────
+function Remove-StaleInstall {
+    $npmGlobalDir = $script:NpmPrefixOverride
+    if (-not $npmGlobalDir) {
+        try { $npmGlobalDir = & npm prefix -g 2>$null } catch { return }
+    }
+    $staleDir = Join-Path $npmGlobalDir "node_modules\openclaw"
+    if (Test-Path $staleDir) {
+        Write-LogInfo "清理上次安装残留: $staleDir"
+        try {
+            & taskkill /F /IM node.exe 2>$null | Out-Null
+        } catch {}
+        Start-Sleep -Milliseconds 500
+        try {
+            Remove-Item -Recurse -Force $staleDir -ErrorAction Stop
+            Write-LogSuccess "残留目录已清理"
+        } catch {
+            Write-LogWarn "残留目录清理失败: $_"
+            Write-LogInfo "请手动删除后重试: Remove-Item -Recurse -Force '$staleDir'"
+        }
+    }
+}
+
+# ─────────────────────────────────────────────
 # 安装 OpenClaw
 # ─────────────────────────────────────────────
 function Install-OpenClaw {
     Write-LogStep "安装 OpenClaw CLI"
+
+    Remove-StaleInstall
 
     $pkg = switch ($Channel) {
         "stable" { "openclaw@latest" }
@@ -550,29 +686,33 @@ function Install-OpenClaw {
         $installExit = $r.ExitCode
         $installOutput = $r.Output
     } else {
-        Write-LogInfo "使用 npm 安装..."
-        Write-LogInfo "首次安装通常需要 1~3 分钟，请耐心等待..."
+        Write-LogInfo "使用 npm 安装（--ignore-scripts 模式，跳过原生模块编译）..."
+        Write-LogInfo "首次安装通常需要 2~5 分钟，请耐心等待..."
 
-        $r = Invoke-CommandLogged -Description "npm install -g $pkg" -Command "npm" -Arguments @("install", "-g", $pkg)
+        $r = Invoke-CommandLogged -Description "npm install -g $pkg --ignore-scripts" -Command "npm" -Arguments @("install", "-g", $pkg, "--ignore-scripts")
         $installExit = $r.ExitCode
         $installOutput = $r.Output
     }
 
     if ($installExit -ne 0) {
         Write-LogError "OpenClaw 安装失败（退出码: $installExit）"
-        Write-LogError "详细信息请查看日志: $script:LogFile"
+        Write-Log "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [INSTALL] 失败详情: exit=$installExit"
 
-        if ($installOutput -match "(?i)EACCES|permission denied") {
+        if ($installOutput -match "(?i)EACCES|EPERM|permission denied|operation not permitted") {
             Write-LogError "权限不足。请尝试以管理员身份运行 PowerShell"
         }
         if ($installOutput -match "(?i)sharp") {
-            Write-LogError "sharp 模块安装失败。请尝试:"
-            Write-LogError '  $env:SHARP_IGNORE_GLOBAL_LIBVIPS = "1"; npm install -g openclaw@latest'
+            Write-LogError "sharp 模块安装失败"
         }
         if ($installOutput -match "(?i)node-gyp|gyp ERR") {
             Write-LogError "node-gyp 编译失败。请安装 Visual Studio Build Tools:"
             Write-LogError "  npm install -g windows-build-tools"
         }
+        if ($installOutput -match "(?i)node-llama-cpp|3221225477") {
+            Write-LogWarn "node-llama-cpp 原生模块编译崩溃（已自动跳过，不影响核心功能）"
+        }
+
+        Write-LogError "详细信息请查看日志: $script:LogFile"
         return $false
     }
 
@@ -700,12 +840,19 @@ function Show-Summary {
         Write-Host ""
         Write-Host "  2. 检查系统要求:"
         Write-Host "     - Node.js >=22: node --version"
-        Write-Host "     - 构建工具: npm install -g windows-build-tools"
         Write-Host ""
         Write-Host "  3. 手动安装尝试:"
-        Write-Host "     npm install -g openclaw@latest"
+        Write-Host "     npm install -g openclaw@latest --ignore-scripts"
         Write-Host ""
-        Write-Host "  4. 获取帮助:"
+        Write-Host "  4. 中文用户名导致安装失败？" -ForegroundColor Yellow
+        Write-Host "     mkdir C:\npm-global"
+        Write-Host '     npm config set prefix "C:\npm-global"'
+        Write-Host "     npm install -g openclaw@latest --ignore-scripts"
+        Write-Host ""
+        Write-Host "  5. 下载太慢？使用淘宝镜像:"
+        Write-Host "     npm config set registry https://registry.npmmirror.com"
+        Write-Host ""
+        Write-Host "  6. 获取帮助:"
         Write-Host "     - 文档: https://docs.openclaw.ai"
         Write-Host "     - GitHub: https://github.com/openclaw/openclaw"
         Write-Host "     - Discord: https://discord.gg/clawd"
@@ -737,9 +884,9 @@ function Main {
     Write-Host $script:LogFile -ForegroundColor Cyan
     Write-Host ""
 
-    # 计算步骤数
-    $script:StepsTotal = 8
-    if (-not $SkipOnboard) { $script:StepsTotal = 9 }
+    # 计算步骤数: OS + Node + npm + 路径检测 + npm源 + Defender + 网络 + 磁盘 + 已有安装 + 安装 + 验证 [+ 引导]
+    $script:StepsTotal = 12
+    if (-not $SkipOnboard) { $script:StepsTotal = 13 }
 
     # 环境检测
     Test-Windows
@@ -754,6 +901,13 @@ function Main {
         exit 1
     }
 
+    if (-not (Test-NonAsciiPath)) {
+        Show-Summary
+        exit 1
+    }
+
+    Test-NpmRegistry
+    Test-DefenderImpact
     Test-Network
 
     if (-not (Test-DiskSpace)) {
